@@ -1,0 +1,323 @@
+import cv2
+import mediapipe as mp
+import pygame
+import numpy as np
+import random
+import math
+
+
+class MagicBallGame:
+    def __init__(self):
+        pygame.init()
+        self.total_width = 1280
+        self.screen_height = 720
+        self.game_width = 800
+        self.camera_width = self.total_width - self.game_width
+
+        self.screen = pygame.display.set_mode((self.total_width, self.screen_height))
+        pygame.display.set_caption(" 手势魔法球")
+
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5)
+
+        self.ball_x = self.game_width // 2
+        self.ball_y = self.screen_height // 2
+        self.ball_radius = 20
+        self.energies = []
+        self.obstacles = []
+        self.last_obstacle_time = 0
+        self.score = 0
+        self.game_time = 120 * 1000
+        self.divider_color = (100, 100, 100)
+        self.running = True
+        self.current_spell = None
+
+    def process_gestures(self, frame, current_time):
+        results = self.hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        if results.multi_hand_landmarks:
+            landmarks = results.multi_hand_landmarks[0].landmark
+            wrist = landmarks[self.mp_hands.HandLandmark.WRIST]
+
+            base_scale = 2.5
+            vertical_scale = 3.0
+            edge_buffer = 0.1
+            smooth_factor = 0.3
+            move_threshold = 0.05
+
+            if not hasattr(self, 'smooth_ball_x'):
+                self.smooth_ball_x = self.game_width // 2
+                self.smooth_ball_y = self.screen_height // 2
+                self.init_wrist_x = wrist.x
+                self.init_wrist_y = wrist.y
+
+            edge_scale = 1.0
+            if wrist.x < 0.1 or wrist.x > 0.9 or wrist.y < 0.1 or wrist.y > 0.9:
+                edge_scale = 0.5
+
+            direction_scale = 1.0
+            if (wrist.x > self.init_wrist_x) and (wrist.y > self.init_wrist_y):
+                direction_scale = 1.8
+
+            rel_x = max(-0.4, min(0.4, (self.init_wrist_x - wrist.x))) * base_scale * edge_scale
+            rel_y = max(-0.4, min(0.4, (wrist.y - self.init_wrist_y))) * vertical_scale * edge_scale * direction_scale
+
+            target_x = self.game_width / 2 + rel_x * self.game_width / 2
+            target_y = self.screen_height / 2 + rel_y * self.screen_height / 2
+
+            if abs(target_x - self.smooth_ball_x) > move_threshold or abs(
+                    target_y - self.smooth_ball_y) > move_threshold:
+                self.smooth_ball_x = self.smooth_ball_x * (1 - smooth_factor) + target_x * smooth_factor
+                self.smooth_ball_y = self.smooth_ball_y * (1 - smooth_factor) + target_y * smooth_factor
+
+            self.ball_x = int(self.smooth_ball_x)
+            self.ball_y = int(self.smooth_ball_y)
+
+            self.ball_x = max(20, min(self.ball_x, self.game_width - 20))
+            self.ball_y = max(20, min(self.ball_y, self.screen_height - 20))
+
+            thumb_tip = landmarks[self.mp_hands.HandLandmark.THUMB_TIP]
+            index_tip = landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            middle_tip = landmarks[self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+            pinky_tip = landmarks[self.mp_hands.HandLandmark.PINKY_TIP]
+            ring_tip = landmarks[self.mp_hands.HandLandmark.RING_FINGER_TIP]
+
+            distances = [
+                abs(thumb_tip.y - wrist.y),
+                abs(index_tip.y - wrist.y),
+                abs(middle_tip.y - wrist.y),
+                abs(ring_tip.y - wrist.y),
+                abs(pinky_tip.y - wrist.y)
+            ]
+            avg_distance = sum(distances) / len(distances)
+
+            self.current_spell = None
+
+            index_straight = (index_tip.y < landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_MCP].y + 0.05)
+            middle_straight = (middle_tip.y < landmarks[self.mp_hands.HandLandmark.MIDDLE_FINGER_MCP].y + 0.05)
+            thumb_bent = (thumb_tip.y > landmarks[self.mp_hands.HandLandmark.THUMB_IP].y - 0.03)
+            ring_bent = (ring_tip.y > landmarks[self.mp_hands.HandLandmark.RING_FINGER_PIP].y - 0.03)
+            pinky_bent = (pinky_tip.y > landmarks[self.mp_hands.HandLandmark.PINKY_PIP].y - 0.03)
+
+            if index_straight and middle_straight and thumb_bent and ring_bent and pinky_bent:
+                self.current_spell = "wind"
+                if len(self.energies) >= 2:
+                    absorbed = random.sample(self.energies, 2)
+                    for energy in absorbed:
+                        self.score += 10
+                        self.energies.remove(energy)
+                elif len(self.energies) > 0:
+                    for energy in self.energies[:]:
+                        self.score += 10
+                        self.energies.remove(energy)
+
+            elif avg_distance < 0.06:
+                self.current_spell = "fire"
+
+            elif (thumb_tip.y < landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_MCP].y + 0.05 and
+                  thumb_tip.y < landmarks[self.mp_hands.HandLandmark.MIDDLE_FINGER_MCP].y + 0.05):
+                self.current_spell = "ice"
+                for obstacle in self.obstacles:
+                    if obstacle['state'] == 'normal':
+                        obstacle['state'] = 'breaking'
+                        obstacle['break_timer'] = current_time
+                        obstacle['pieces'] = []
+                        for i in range(5):
+                            obstacle['pieces'].append({
+                                'x': obstacle['x'] + random.randint(0, obstacle['width']),
+                                'y': obstacle['y'] + random.randint(0, obstacle['height']),
+                                'size': random.randint(5, 15),
+                                'vx': random.uniform(-3, 3),
+                                'vy': random.uniform(-5, -1)
+                            })
+
+            elif avg_distance > 0.12:
+                self.current_spell = None
+
+        return results
+
+    def draw_spell_effects(self):
+        if self.current_spell:
+            if self.current_spell == "fire":
+                color = (255, 100, 100)
+            elif self.current_spell == "ice":
+                color = (100, 100, 255)
+            elif self.current_spell == "wind":
+                color = (100, 255, 100)
+            else:
+                color = (200, 200, 200)
+
+            pygame.draw.circle(
+                self.screen,
+                color,
+                (self.ball_x, self.ball_y),
+                self.ball_radius + 15, 2)
+
+    def run(self):
+        cap = cv2.VideoCapture(0)
+        clock = pygame.time.Clock()
+
+        self.energies = []
+        self.last_energy_time = 0
+        self.score = 0
+        self.game_time = 120 * 1000
+        self.start_time = pygame.time.get_ticks()
+
+        while self.running:
+            clock.tick(30)
+            current_time = pygame.time.get_ticks()
+            time_left = max(0, self.game_time - (current_time - self.start_time))
+
+
+            if current_time - self.last_energy_time > 2000 and len(self.energies) < 5:
+                if random.random() < 0.8:  # 80%概率在左上1/4区域
+                    self.energies.append({
+                        'x': random.randint(50, self.game_width // 4),
+                        'y': random.randint(50, self.screen_height // 4),
+                        'color': (random.randint(100, 255), random.randint(100, 255), random.randint(100, 255))
+                    })
+                else:  # 20%概率在其他区域 
+                    self.energies.append({
+                        'x': random.randint(50, self.game_width - 50),
+                        'y': random.randint(50, self.screen_height - 50),
+                        'color': (random.randint(100, 255), random.randint(100, 255), random.randint(100, 255))
+                    })
+                self.last_energy_time = current_time
+
+
+            if current_time - self.last_obstacle_time > 3000 and len(self.obstacles) < 3:
+                if random.random() < 0.7:  # 70%概率在左上1/4区域
+                    self.obstacles.append({
+                        'x': random.randint(50, self.game_width // 3),
+                        'y': random.randint(50, self.screen_height // 3),
+                        'width': random.randint(30, 80),
+                        'height': random.randint(30, 80),
+                        'state': 'normal',
+                        'break_timer': 0,
+                        'pieces': []
+                    })
+                else:  # 30%概率在其他区域 
+                    self.obstacles.append({
+                        'x': random.randint(50, self.game_width - 50),
+                        'y': random.randint(50, self.screen_height - 50),
+                        'width': random.randint(30, 80),
+                        'height': random.randint(30, 80),
+                        'state': 'normal',
+                        'break_timer': 0,
+                        'pieces': []
+                    })
+                self.last_obstacle_time = current_time
+
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            results = self.process_gestures(frame, current_time)
+
+            pygame.draw.rect(self.screen, (0, 0, 50), (0, 0, self.game_width, self.screen_height))
+            pygame.draw.rect(self.screen, (30, 30, 30), (self.game_width, 0, self.camera_width, self.screen_height))
+            pygame.draw.line(self.screen, self.divider_color,
+                             (self.game_width, 0), (self.game_width, self.screen_height), 3)
+
+            pygame.draw.circle(self.screen, (255, 100, 100),
+                               (min(self.ball_x, self.game_width - 20), self.ball_y), 20)
+
+            for obstacle in self.obstacles[:]:
+                if obstacle['state'] == 'normal':
+                    pygame.draw.rect(self.screen, (0, 0, 0),
+                                     (obstacle['x'], obstacle['y'], obstacle['width'], obstacle['height']))
+
+                    if (abs(self.ball_x - (obstacle['x'] + obstacle['width'] / 2)) < (20 + obstacle['width'] / 2) and
+                            abs(self.ball_y - (obstacle['y'] + obstacle['height'] / 2)) < (
+                                    20 + obstacle['height'] / 2)):
+                        self.ball_x = max(20, min(self.ball_x, self.game_width - 20))
+                        self.ball_y = max(20, min(self.ball_y, self.screen_height - 20))
+
+                        if self.current_spell is None:
+                            self.score = max(0, self.score - 30)
+                elif obstacle['state'] == 'breaking':
+                    for piece in obstacle['pieces']:
+                        pygame.draw.rect(self.screen, (100, 100, 100),
+                                         (piece['x'], piece['y'], piece['size'], piece['size']))
+                        piece['x'] += piece['vx']
+                        piece['y'] += piece['vy']
+                        piece['vy'] += 0.2
+
+                    if current_time - obstacle['break_timer'] > 1000:
+                        obstacle['state'] = 'broken'
+
+            for obstacle in self.obstacles[:]:
+                if obstacle['state'] == 'broken':
+                    self.obstacles.remove(obstacle)
+
+            for energy in self.energies[:]:
+                if energy['x'] < self.game_width:
+                    pygame.draw.circle(self.screen, energy['color'],
+                                       (energy['x'], energy['y']), 15)
+
+                    distance = math.sqrt((self.ball_x - energy['x']) ** 2 + (self.ball_y - energy['y']) ** 2)
+                    if distance < 35:
+                        self.energies.remove(energy)
+                        if self.current_spell == "fire":
+                            self.score += 20
+                        else:
+                            self.score += 10
+
+            self.draw_spell_effects()
+
+            font = pygame.font.SysFont(None, 36)
+            score_text = font.render(f"SCORE:  {self.score}", True, (255, 255, 255))
+            time_text = font.render(f"TIME:  {time_left // 1000}s", True, (255, 255, 255))
+            gesture_text = font.render(f"Gesture:  {self.current_spell if self.current_spell else 'None'}", True,
+                                       (255, 255, 255))
+            self.screen.blit(score_text, (20, 20))
+            self.screen.blit(time_text, (20, 60))
+            self.screen.blit(gesture_text, (20, 100))
+
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_rotated = np.rot90(frame_rgb)
+                frame_surface = pygame.surfarray.make_surface(frame_rotated)
+                frame_surface = pygame.transform.scale(frame_surface, (self.camera_width, self.screen_height // 2))
+                self.screen.blit(frame_surface, (self.game_width, 0))
+
+                if results.multi_hand_landmarks:
+                    annotated_image = frame_rgb.copy()
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        mp.solutions.drawing_utils.draw_landmarks(
+                            annotated_image, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+
+                    annotated_rotated = np.rot90(annotated_image)
+                    annotated_surface = pygame.surfarray.make_surface(annotated_rotated)
+                    annotated_surface = pygame.transform.scale(annotated_surface,
+                                                               (self.camera_width, self.screen_height // 2))
+                    self.screen.blit(annotated_surface, (self.game_width, self.screen_height // 2))
+
+            if time_left <= 0:
+                font = pygame.font.SysFont(None, 48)
+                game_over = font.render(f"GameOver!  : {self.score}", True, (255, 255, 255))
+                text_width = game_over.get_width()
+                self.screen.blit(game_over, (self.game_width // 2 - text_width // 2, self.screen_height // 2))
+                pygame.display.flip()
+                pygame.time.wait(3000)
+                self.running = False
+                continue
+
+            pygame.display.flip()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self.running = False
+
+        cap.release()
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    game = MagicBallGame()
+    game.run() 
